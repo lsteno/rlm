@@ -11,15 +11,22 @@ The REPL environment is initialized with:
 1. A `context` variable that contains extremely important information about your query. You should check the content of the `context` variable to understand what you are working with. Make sure you look through it sufficiently as you answer your query.
 2. A `llm_query(prompt, model=None)` function that makes a single LLM completion call (no REPL, no iteration). Fast and lightweight -- use this for simple extraction, summarization, or Q&A over a chunk of text. The sub-LLM can handle around 500K chars.
 3. A `llm_query_batched(prompts, model=None)` function that runs multiple `llm_query` calls concurrently: returns `List[str]` in the same order as input prompts. Much faster than sequential `llm_query` calls for independent queries.
-4. A `rlm_query(prompt, model=None)` function that spawns a **recursive RLM sub-call** for deeper thinking subtasks. The child gets its own REPL environment and can reason iteratively over the prompt, just like you. Use this when a subtask requires multi-step reasoning, code execution, or its own iterative problem-solving -- not just a simple one-shot answer. Falls back to `llm_query` if recursion is not available.
-5. A `rlm_query_batched(prompts, model=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. Falls back to `llm_query_batched` if recursion is not available.
-6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. Use this to check what variables exist before using FINAL_VAR.
-7. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
+4. A `rlm_query(prompt, model=None, max_depth=None)` function that spawns a **recursive RLM sub-call** for deeper thinking subtasks. The child gets its own REPL environment and can reason iteratively over the prompt, just like you. Use this when a subtask requires multi-step reasoning, code execution, or its own iterative problem-solving -- not just a simple one-shot answer. Falls back to `llm_query` if recursion is not available.
+5. A `rlm_query_batched(prompts, model=None, max_depth=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. Falls back to `llm_query_batched` if recursion is not available.
+{repl_capabilities_section}
 {custom_tools_section}
 
 **When to use `llm_query` vs `rlm_query`:**
 - Use `llm_query` for simple, one-shot tasks: extracting info from a chunk, summarizing text, answering a factual question, classifying content. These are fast single LLM calls.
 - Use `rlm_query` when the subtask itself requires deeper thinking: multi-step reasoning, solving a sub-problem that needs its own REPL and iteration, or tasks where a single LLM call might not be enough. The child RLM can write and run code, query further sub-LLMs, and iterate to find the answer.
+
+**Recursion budget (`max_depth` argument in `rlm_query*`):**
+- Treat `max_depth` in `rlm_query`, `rlm_query_batched`{async_recursion_name} as a **remaining recursion budget** for the child subtree, not an absolute depth index.
+- If you delegate with `max_depth=k`, then a child that delegates again can pass at most `max_depth=k-1`.
+- Use `max_depth=0` to force a leaf child (child can reason itself, but should not spawn deeper recursive children).
+- The root/global recursion cap is still enforced by the parent RLM config; your per-call budget cannot exceed it.
+
+{async_batched_guidance_section}
 
 **Breaking down problems:** You must break problems into more digestible components—whether that means chunking or summarizing a large context, or decomposing a hard task into easier sub-problems and delegating them via `llm_query` / `rlm_query`. Use the REPL to write a **programmatic strategy** that uses these LLM calls to solve the problem, as if you were building an agent: plan steps, branch on results, combine answers in code.
 
@@ -82,7 +89,10 @@ final_answer = llm_query(f"Aggregating all the answers per chunk, answer the ori
 For subtasks that require deeper reasoning (e.g. solving a complex sub-problem), use `rlm_query` instead. The child gets its own REPL to iterate; you can then use the result in parent logic:
 ```repl
 # Child RLM solves the sub-problem in its own REPL; we use the result in code
-trend = rlm_query(f"Analyze this dataset and conclude with one word: up, down, or stable: {{data}}")
+trend = rlm_query(
+    f"Analyze this dataset and conclude with one word: up, down, or stable: {{data}}",
+    max_depth=1,
+)
 if "up" in trend.lower():
     recommendation = "Consider increasing exposure."
 elif "down" in trend.lower():
@@ -90,6 +100,18 @@ elif "down" in trend.lower():
 else:
     recommendation = "Hold position."
 final_answer = llm_query(f"Given trend={{trend}} and recommendation={{recommendation}}, one-sentence summary for the user.")
+```
+
+For independent recursive subtasks, use async fan-out and then aggregate:
+```repl
+sub_prompts = [
+    f"Analyze chunk {{i}} and return key facts with citations.\\n\\n{{chunk}}"
+    for i, chunk in enumerate(chunks)
+]
+sub_answers = rlm_query_batched_async(sub_prompts, max_depth=1, max_workers=8)
+final_answer = llm_query(
+    "Merge these chunk-level findings into one final answer:\\n" + "\\n".join(sub_answers)
+)
 ```
 
 As a final example, implement the solution as a **program**: try one approach via `rlm_query`; inspect the result and branch. If it suffices, use it. If not, break into one easier subproblem and delegate that only. More branches, one path runs—don't load the model. Example: prove sqrt 2 irrational.
@@ -120,6 +142,10 @@ def build_rlm_system_prompt(
     system_prompt: str,
     query_metadata: QueryMetadata,
     custom_tools: dict[str, Any] | None = None,
+    recursion_budget: int | None = None,
+    current_depth: int = 0,
+    max_depth: int = 1,
+    enable_rlm_query_batched_async: bool = False,
 ) -> list[dict[str, str]]:
     """
     Build the initial system prompt for the REPL environment based on extra prompt metadata.
@@ -147,13 +173,64 @@ def build_rlm_system_prompt(
     tools_formatted = format_tools_for_prompt(custom_tools)
     if tools_formatted:
         custom_tools_section = (
-            f"\n6. Custom tools and data available in the REPL:\n{tools_formatted}"
+            f"\n9. Custom tools and data available in the REPL:\n{tools_formatted}"
         )
     else:
         custom_tools_section = ""
 
+    if enable_rlm_query_batched_async:
+        repl_capabilities_section = (
+            "6. A `rlm_query_batched_async(prompts, model=None, max_depth=None, max_workers=None)` "
+            "function that spawns multiple recursive RLM sub-calls concurrently. Use this when child subtasks "
+            "are independent and you want parallel recursion.\n"
+            "7. A `SHOW_VARS()` function that returns all variables you have created in the REPL. "
+            "Use this to check what variables exist before using FINAL_VAR.\n"
+            "8. The ability to use `print()` statements to view the output of your REPL code "
+            "and continue your reasoning."
+        )
+        async_recursion_name = ", and `rlm_query_batched_async`"
+        async_batched_guidance_section = textwrap.dedent(
+            """
+            **`rlm_query_batched` vs `rlm_query_batched_async` (recursive calls):**
+            - `rlm_query_batched`: runs child RLM sub-calls one-by-one (serial). Use when later subtasks depend on earlier ones, or when you want stricter resource usage.
+            - `rlm_query_batched_async`: runs child RLM sub-calls concurrently (parallel workers). Use when child subtasks are independent and you want lower wall-clock time.
+            - Return order: both preserve prompt order in outputs (`outputs[i]` corresponds to `prompts[i]`) even if async children finish at different times.
+            - Practical timing: for N independent prompts, serial is closer to sum of child runtimes; async is closer to the slowest child (plus overhead / provider limits).
+
+            **How to use `rlm_query_batched_async` effectively:**
+            - Use it only when child tasks are independent (e.g., per-document or per-chunk analysis).
+            - Keep prompt-to-result alignment by indexing prompts and reading outputs in the same order.
+            - Control fan-out with `max_workers` when needed; avoid huge fan-out plus deep recursion at once.
+            - Typical pattern: async fan-out for first-pass extraction, then one merge/synthesis call.
+            """
+        ).strip()
+    else:
+        repl_capabilities_section = (
+            "6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. "
+            "Use this to check what variables exist before using FINAL_VAR.\n"
+            "7. The ability to use `print()` statements to view the output of your REPL code "
+            "and continue your reasoning."
+        )
+        async_recursion_name = ""
+        async_batched_guidance_section = ""
+
     # Insert custom tools section into the system prompt
-    final_system_prompt = system_prompt.format(custom_tools_section=custom_tools_section)
+    final_system_prompt = system_prompt.format(
+        custom_tools_section=custom_tools_section,
+        repl_capabilities_section=repl_capabilities_section,
+        async_recursion_name=async_recursion_name,
+        async_batched_guidance_section=async_batched_guidance_section,
+    )
+
+    if recursion_budget is not None:
+        final_system_prompt += (
+            "\n\nRecursion budget information for this node:\n"
+            f"- Current depth index: {current_depth}\n"
+            f"- Current recursion budget: {recursion_budget}\n"
+            f"- Hard recursion cap for this branch: max_depth={max_depth}\n"
+            "Interpretation: if your current recursion budget is b>0, you can delegate children and should usually pass max_depth=b-1. "
+            "If b=0, avoid recursive delegation and use llm_query / llm_query_batched instead."
+        )
 
     metadata_prompt = f"Your context is a {context_type} with {context_total_length} total characters, and is broken up into chunks of char lengths: {context_lengths}."
 

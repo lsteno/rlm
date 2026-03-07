@@ -1,3 +1,4 @@
+import concurrent.futures
 import copy
 import io
 import json
@@ -131,10 +132,11 @@ class LocalREPL(NonIsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
-        subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        subcall_fn: Callable[..., RLMChatCompletion] | None = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
+        enable_rlm_query_batched_async: bool = False,
         **kwargs,
     ):
         super().__init__(persistent=persistent, depth=depth, **kwargs)
@@ -147,6 +149,7 @@ class LocalREPL(NonIsolatedEnv):
         self._context_count: int = 0
         self._history_count: int = 0
         self.compaction = compaction
+        self.enable_rlm_query_batched_async = enable_rlm_query_batched_async
 
         # Custom tools: functions available in the REPL
         self.custom_tools = custom_tools or {}
@@ -194,6 +197,8 @@ class LocalREPL(NonIsolatedEnv):
         self.globals["llm_query_batched"] = self._llm_query_batched
         self.globals["rlm_query"] = self._rlm_query
         self.globals["rlm_query_batched"] = self._rlm_query_batched
+        if self.enable_rlm_query_batched_async:
+            self.globals["rlm_query_batched_async"] = self._rlm_query_batched_async
 
         # Add custom tools to globals
         # Tools can be either plain values or (value, description) tuples
@@ -293,7 +298,26 @@ class LocalREPL(NonIsolatedEnv):
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
 
-    def _rlm_query(self, prompt: str, model: str | None = None) -> str:
+    def _invoke_subcall(
+        self,
+        prompt: str,
+        model: str | None = None,
+        max_depth: int | None = None,
+    ) -> RLMChatCompletion:
+        """Invoke recursive subcall callback, optionally passing recursion budget."""
+        if self.subcall_fn is None:
+            raise RuntimeError("No subcall_fn configured")
+
+        if max_depth is None:
+            return self.subcall_fn(prompt, model)
+        return self.subcall_fn(prompt, model, max_depth)
+
+    def _rlm_query(
+        self,
+        prompt: str,
+        model: str | None = None,
+        max_depth: int | None = None,
+    ) -> str:
         """Spawn a recursive RLM sub-call for deeper thinking on a subtask.
 
         When a subcall callback is available (max_depth > 1), this spawns a child
@@ -303,10 +327,11 @@ class LocalREPL(NonIsolatedEnv):
         Args:
             prompt: The prompt to send to the child RLM.
             model: Optional model name override for the child.
+            max_depth: Optional recursion budget for the child subtree.
         """
         if self.subcall_fn is not None:
             try:
-                completion = self.subcall_fn(prompt, model)
+                completion = self._invoke_subcall(prompt, model=model, max_depth=max_depth)
                 self._pending_llm_calls.append(completion)
                 return completion.response
             except Exception as e:
@@ -315,7 +340,12 @@ class LocalREPL(NonIsolatedEnv):
         # Fall back to plain LM call if no recursive capability
         return self._llm_query(prompt, model)
 
-    def _rlm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+    def _rlm_query_batched(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        max_depth: int | None = None,
+    ) -> list[str]:
         """Spawn recursive RLM sub-calls for multiple prompts.
 
         Each prompt gets its own child RLM for deeper thinking.
@@ -324,6 +354,7 @@ class LocalREPL(NonIsolatedEnv):
         Args:
             prompts: List of prompts for child RLMs.
             model: Optional model name override for the children.
+            max_depth: Optional recursion budget for each child subtree.
 
         Returns:
             List of responses in the same order as input prompts.
@@ -332,12 +363,76 @@ class LocalREPL(NonIsolatedEnv):
             results = []
             for prompt in prompts:
                 try:
-                    completion = self.subcall_fn(prompt, model)
+                    completion = self._invoke_subcall(prompt, model=model, max_depth=max_depth)
                     self._pending_llm_calls.append(completion)
                     results.append(completion.response)
                 except Exception as e:
                     results.append(f"Error: RLM query failed - {e}")
             return results
+
+        # Fall back to plain batched LM call if no recursive capability
+        return self._llm_query_batched(prompts, model)
+
+    def _rlm_query_batched_async(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        max_depth: int | None = None,
+        max_workers: int | None = None,
+    ) -> list[str]:
+        """Spawn recursive RLM sub-calls for multiple prompts concurrently.
+
+        This is useful when sub-problems are independent and can run in parallel.
+        Falls back to llm_query_batched if no recursive capability is configured.
+
+        Args:
+            prompts: List of prompts for child RLMs.
+            model: Optional model name override for the children.
+            max_depth: Optional recursion budget for each child subtree.
+            max_workers: Optional maximum number of worker threads for subcalls.
+
+        Returns:
+            List of responses in the same order as input prompts.
+        """
+        if self.subcall_fn is not None:
+            if not prompts:
+                return []
+
+            workers = max_workers if max_workers is not None else min(32, len(prompts))
+            workers = max(1, workers)
+
+            def run_one(prompt: str) -> tuple[bool, RLMChatCompletion | str]:
+                try:
+                    completion = self._invoke_subcall(prompt, model=model, max_depth=max_depth)
+                    return True, completion
+                except Exception as e:
+                    return False, f"Error: RLM query failed - {e}"
+
+            ordered_results: list[tuple[bool, RLMChatCompletion | str] | None] = [None] * len(prompts)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_idx = {
+                    executor.submit(run_one, prompt): idx for idx, prompt in enumerate(prompts)
+                }
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    ordered_results[idx] = future.result()
+
+            outputs: list[str] = []
+            for item in ordered_results:
+                if item is None:
+                    outputs.append("Error: RLM query failed - internal scheduling error")
+                    continue
+                success, payload = item
+                if success:
+                    completion = payload
+                    if isinstance(completion, RLMChatCompletion):
+                        self._pending_llm_calls.append(completion)
+                        outputs.append(completion.response)
+                    else:
+                        outputs.append("Error: RLM query failed - invalid completion type")
+                else:
+                    outputs.append(str(payload))
+            return outputs
 
         # Fall back to plain batched LM call if no recursive capability
         return self._llm_query_batched(prompts, model)
@@ -468,6 +563,11 @@ class LocalREPL(NonIsolatedEnv):
                 self.globals["rlm_query"] = self._rlm_query
             elif name == "rlm_query_batched":
                 self.globals["rlm_query_batched"] = self._rlm_query_batched
+            elif name == "rlm_query_batched_async":
+                if self.enable_rlm_query_batched_async:
+                    self.globals["rlm_query_batched_async"] = self._rlm_query_batched_async
+                else:
+                    self.globals.pop("rlm_query_batched_async", None)
             elif name == "FINAL_VAR":
                 self.globals["FINAL_VAR"] = self._final_var
             elif name == "SHOW_VARS":

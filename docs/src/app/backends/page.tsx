@@ -6,9 +6,7 @@ export default function BackendsPage() {
       <h1 className="text-3xl font-bold mb-4">Backends</h1>
       
       <p className="text-muted-foreground mb-6">
-        <p>
-          RLMs natively support a wide range of language model providers, including <code>OpenAI</code>, <code>Anthropic</code>, <code>Portkey</code>, <code>OpenRouter</code>, and <code>LiteLLM</code>. Additional providers can be supported with minimal effort. The <code>backend_kwargs</code> are named arguments passed directly to the backend client.
-        </p>
+        RLMs natively support a wide range of language model providers, including <code>OpenAI</code>, <code>Anthropic</code>, <code>Portkey</code>, <code>OpenRouter</code>, and <code>LiteLLM</code>. Additional providers can be supported with minimal effort. The <code>backend_kwargs</code> are named arguments passed directly to the backend client.
       </p>
 
       <hr className="my-8 border-border" />

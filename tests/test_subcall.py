@@ -470,3 +470,134 @@ class TestSubcallCombinedParameters:
             assert child_backend_kwargs.get("api_key") == "test-key"
 
             parent.close()
+
+
+class TestSubcallDepthBudgetSemantics:
+    """Tests for per-subcall recursion-budget semantics for max_depth override."""
+
+    def test_subcall_max_depth_is_treated_as_recursion_budget(self):
+        """Passing max_depth=k should map to a child cap that allows k deeper recursive levels."""
+        captured_child_params = {}
+
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_lm = create_mock_lm(["FINAL(answer)"])
+            mock_get_client.return_value = mock_lm
+
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "parent-model"},
+                depth=0,
+                max_depth=10,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt", max_depth=2)
+
+            # Parent depth=0 -> child depth=1. Budget=2 means allow two deeper levels under child,
+            # so child cap should be depth 4.
+            assert captured_child_params.get("depth") == 1
+            assert captured_child_params.get("recursion_budget") == 2
+            assert captured_child_params.get("max_depth") == 4
+
+            parent.close()
+
+    def test_subcall_budget_zero_creates_leaf_child(self):
+        """max_depth=0 should create a child that cannot recurse further."""
+        captured_child_params = {}
+
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_lm = create_mock_lm(["FINAL(answer)"])
+            mock_get_client.return_value = mock_lm
+
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "parent-model"},
+                depth=0,
+                max_depth=10,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt", max_depth=0)
+
+            # Child at depth=1 with cap=2 means no recursive children below it.
+            assert captured_child_params.get("depth") == 1
+            assert captured_child_params.get("recursion_budget") == 0
+            assert captured_child_params.get("max_depth") == 2
+
+            parent.close()
+
+    def test_subcall_budget_is_clipped_by_parent_global_max_depth(self):
+        """Per-subcall budget must not exceed the root/global max_depth cap."""
+        captured_child_params = {}
+
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_lm = create_mock_lm(["FINAL(answer)"])
+            mock_get_client.return_value = mock_lm
+
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "parent-model"},
+                depth=0,
+                max_depth=3,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt", max_depth=99)
+
+            # Budget would imply a deeper cap, but global cap stays 3.
+            assert captured_child_params.get("recursion_budget") == 99
+            assert captured_child_params.get("max_depth") == 3
+
+            parent.close()
+
+    def test_subcall_default_budget_decrements_from_parent(self):
+        """Without override, child recursion_budget should be parent_budget - 1."""
+        captured_child_params = {}
+
+        original_rlm_class = rlm_module.RLM
+
+        class CapturingRLM(original_rlm_class):
+            def __init__(self, *args, **kwargs):
+                captured_child_params.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_lm = create_mock_lm(["FINAL(answer)"])
+            mock_get_client.return_value = mock_lm
+
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "parent-model"},
+                depth=0,
+                max_depth=6,
+            )
+
+            with patch.object(rlm_module, "RLM", CapturingRLM):
+                parent._subcall("test prompt")
+
+            # Root default recursion_budget is max_depth (6), child should get 5.
+            assert parent.recursion_budget == 6
+            assert captured_child_params.get("recursion_budget") == 5
+
+            parent.close()

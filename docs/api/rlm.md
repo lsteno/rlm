@@ -174,9 +174,14 @@ environment_kwargs = {
 **Type:** `int`
 **Default:** `1`
 
-Maximum recursion depth for nested RLM calls. When `max_depth > 1`, the REPL provides `rlm_query()` and `rlm_query_batched()` functions that spawn child RLMs with their own REPL environments.
+Maximum recursion depth for nested RLM calls. When `max_depth > 1`, the REPL provides `rlm_query()`, `rlm_query_batched()`, and `rlm_query_batched_async()` functions that spawn child RLMs with their own REPL environments.
 
 When `depth >= max_depth`, `rlm_query()` falls back to a plain `llm_query()` call (no REPL, no iteration).
+
+Per-call recursion controls:
+- `rlm_query(..., max_depth=k)` and batched variants treat `k` as a recursion budget for that child subtree (remaining recursive levels under that child).
+- A child can pass a smaller budget to its own children (commonly `k-1`).
+- This per-call budget is always clipped by the root/global `RLM(max_depth=...)` cap.
 
 ```python
 # Enable one level of recursive sub-calls
@@ -254,7 +259,7 @@ Maximum consecutive REPL errors before aborting. The error counter resets on a s
 Override the default RLM system prompt. The default prompt instructs the LM on:
 - How to use the `context` variable
 - How to call `llm_query()` / `llm_query_batched()` for plain LM calls
-- How to call `rlm_query()` / `rlm_query_batched()` for recursive sub-calls
+- How to call `rlm_query()` / `rlm_query_batched()` / `rlm_query_batched_async()` for recursive sub-calls
 - How to signal completion with `FINAL()` or `FINAL_VAR()`
 
 ```python
@@ -548,8 +553,9 @@ The following functions are available to model-generated code inside the REPL:
 |:---------|:------------|
 | `llm_query(prompt, model=None)` | Single plain LM completion. Fast, no REPL or iteration. |
 | `llm_query_batched(prompts, model=None)` | Multiple plain LM completions concurrently. |
-| `rlm_query(prompt, model=None)` | Spawn a child RLM with its own REPL for deeper thinking. Falls back to `llm_query` at max depth. |
-| `rlm_query_batched(prompts, model=None)` | Spawn multiple child RLMs. Falls back to `llm_query_batched` at max depth. |
+| `rlm_query(prompt, model=None, max_depth=None)` | Spawn a child RLM with its own REPL for deeper thinking. Optional `max_depth` is recursion budget for that child subtree. Falls back to `llm_query` at max depth. |
+| `rlm_query_batched(prompts, model=None, max_depth=None)` | Spawn multiple child RLMs (sequential). Optional `max_depth` is recursion budget per child subtree. Falls back to `llm_query_batched` at max depth. |
+| `rlm_query_batched_async(prompts, model=None, max_depth=None, max_workers=None)` | Spawn multiple child RLMs concurrently for independent subtasks. Optional `max_depth` is recursion budget per child subtree. Falls back to `llm_query_batched` if recursion is unavailable. |
 | `FINAL_VAR(variable_name)` | Return a REPL variable as the final answer. |
 | `SHOW_VARS()` | List all user-created variables in the REPL. |
 | `print(...)` | Print output visible to the model in the next iteration. |

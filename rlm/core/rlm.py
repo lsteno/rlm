@@ -55,6 +55,7 @@ class RLM:
         environment_kwargs: dict[str, Any] | None = None,
         depth: int = 0,
         max_depth: int = 1,
+        recursion_budget: int | None = None,
         max_iterations: int = 30,
         max_budget: float | None = None,
         max_timeout: float | None = None,
@@ -70,6 +71,7 @@ class RLM:
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         compaction_threshold_pct: float = 0.85,
+        enable_rlm_query_batched_async: bool = False,
         on_subcall_start: Callable[[int, str, str], None] | None = None,
         on_subcall_complete: Callable[[int, str, float, str | None], None] | None = None,
         on_iteration_start: Callable[[int, int], None] | None = None,
@@ -83,6 +85,9 @@ class RLM:
             environment_kwargs: The kwargs to pass to the environment.
             depth: The current depth of the RLM (0-indexed).
             max_depth: The maximum depth of recursion. When depth >= max_depth, falls back to plain LM completion.
+            recursion_budget: The recursion budget visible to this node. At root, defaults to
+                max_depth. For children, this is inherited from parent policy (typically parent-1,
+                or explicit override in rlm_query(..., max_depth=...)).
             max_iterations: The maximum number of iterations of the RLM.
             max_budget: Maximum budget in USD. Execution stops if exceeded. Requires cost-tracking backend (e.g., OpenRouter).
             max_timeout: Maximum execution time in seconds. Execution stops if exceeded, returning best answer if available.
@@ -102,6 +107,8 @@ class RLM:
                 when root context reaches compaction_threshold_pct of the model's context limit.
             compaction_threshold_pct: When compaction is on, trigger summarization when root
                 message token count reaches this fraction of the model context limit (default 0.85).
+            enable_rlm_query_batched_async: If True, expose `rlm_query_batched_async` in the
+                REPL and include async recursive batching guidance in the system prompt.
             on_subcall_start: Callback fired when a child RLM starts. Args: (depth, model, prompt_preview).
             on_subcall_complete: Callback fired when a child RLM completes. Args: (depth, model, duration, error_or_none).
             on_iteration_start: Callback fired when an iteration starts. Args: (depth, iteration_num).
@@ -132,9 +139,13 @@ class RLM:
 
         self.compaction = compaction
         self.compaction_threshold_pct = compaction_threshold_pct
+        self.enable_rlm_query_batched_async = enable_rlm_query_batched_async
 
         self.depth = depth
         self.max_depth = max_depth
+        self.recursion_budget = (
+            max(0, max_depth - depth) if recursion_budget is None else max(0, recursion_budget)
+        )
         self.max_iterations = max_iterations
         self.max_budget = max_budget
         self.max_timeout = max_timeout
@@ -231,6 +242,8 @@ class RLM:
             # For local environment with max_depth > 1, pass subcall callback for recursive RLM calls
             if self.environment_type == "local" and self.max_depth > 1:
                 env_kwargs["subcall_fn"] = self._subcall
+            if self.environment_type == "local":
+                env_kwargs["enable_rlm_query_batched_async"] = self.enable_rlm_query_batched_async
             # Pass custom tools to the environment
             if self.custom_tools is not None:
                 env_kwargs["custom_tools"] = self.custom_tools
@@ -260,6 +273,10 @@ class RLM:
             system_prompt=self.system_prompt,
             query_metadata=metadata,
             custom_tools=self.custom_tools,
+            recursion_budget=self.recursion_budget,
+            current_depth=self.depth,
+            max_depth=self.max_depth,
+            enable_rlm_query_batched_async=self.enable_rlm_query_batched_async,
         )
         if self.compaction:
             message_history[0]["content"] += (
@@ -642,7 +659,12 @@ class RLM:
         response = client.completion(message)
         return response
 
-    def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
+    def _subcall(
+        self,
+        prompt: str,
+        model: str | None = None,
+        max_depth: int | None = None,
+    ) -> RLMChatCompletion:
         """
         Handle a subcall from the environment, potentially spawning a child RLM.
 
@@ -654,6 +676,9 @@ class RLM:
             prompt: The prompt to process.
             model: Optional model name. If specified, the child RLM will use this model
                 instead of inheriting the parent's default backend.
+            max_depth: Optional recursion budget for this child subtree. This budget
+                is what the child sees and can pass downward (typically child_budget-1).
+                The effective depth is always clipped by the root/global max_depth.
 
         Returns:
             The full RLMChatCompletion from either a child RLM or plain LM completion.
@@ -669,8 +694,18 @@ class RLM:
             child_backend_kwargs = self.backend_kwargs
         resolved_model = model or (child_backend_kwargs or {}).get("model_name", "unknown")
 
+        # Child recursion budget: explicit override wins; otherwise decrement parent's.
+        child_recursion_budget = (
+            max(0, max_depth) if max_depth is not None else max(0, self.recursion_budget - 1)
+        )
+
+        # Effective cap cannot exceed the parent's configured global max_depth.
+        # The child's budget limits how deep recursion can continue below that child.
+        budget_cap = next_depth + 1 + child_recursion_budget
+        effective_max_depth = min(self.max_depth, budget_cap)
+
         # If we'd hit/exceed the cap, do a normal LM completion (no REPL)
-        if next_depth >= self.max_depth:
+        if next_depth >= effective_max_depth:
             # Use other_backend if available, otherwise use main backend
             if self.other_backends and self.other_backend_kwargs:
                 client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
@@ -750,7 +785,8 @@ class RLM:
             environment=self.environment_type,
             environment_kwargs=self.environment_kwargs,
             depth=next_depth,
-            max_depth=self.max_depth,
+            max_depth=effective_max_depth,
+            recursion_budget=child_recursion_budget,
             max_iterations=self.max_iterations,
             max_budget=remaining_budget,
             max_timeout=remaining_timeout,
@@ -768,6 +804,7 @@ class RLM:
             # Propagate callbacks to children for nested tracking
             on_subcall_start=self.on_subcall_start,
             on_subcall_complete=self.on_subcall_complete,
+            enable_rlm_query_batched_async=self.enable_rlm_query_batched_async,
         )
         try:
             result = child.completion(prompt, root_prompt=None)
