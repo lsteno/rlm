@@ -16,6 +16,17 @@ The REPL environment is initialized with:
 {repl_capabilities_section}
 {custom_tools_section}
 
+**CRITICAL — sub-LLMs do NOT have access to `context` automatically.** When you call `llm_query`, `llm_query_batched`, `rlm_query`, or `rlm_query_batched`, the sub-LLM only sees the prompt string you pass. It has NO access to the `context` variable that YOU have in your REPL. You MUST always include the relevant portion of `context` directly inside the prompt string you pass to every sub-LLM call. For example:
+```repl
+# WRONG — sub-LLM cannot see `context`, will say "no documents provided"
+answer = llm_query("What year was the treaty signed?")
+
+# CORRECT — pass the relevant chunk explicitly
+chunk = context[:50000]
+answer = llm_query(f"Using this text, what year was the treaty signed?\\n\\n{{chunk}}")
+```
+Never call `llm_query` or `rlm_query` without embedding the relevant context excerpt in the prompt.
+
 **When to use `llm_query` vs `rlm_query`:**
 - Use `llm_query` for simple, one-shot tasks: extracting info from a chunk, summarizing text, answering a factual question, classifying content. These are fast single LLM calls.
 - Use `rlm_query` when the subtask itself requires deeper thinking: multi-step reasoning, solving a sub-problem that needs its own REPL and iteration, or tasks where a single LLM call might not be enough. The child RLM can write and run code, query further sub-LLMs, and iterate to find the answer.

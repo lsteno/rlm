@@ -58,6 +58,9 @@ test = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
 ]
+training = [
+    "pyarrow>=23.0.0",
+]
 
 [tool.ruff]
 line-length = 100
@@ -81,3 +84,8 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.workspace]
+members = [
+    "training",
+]
