@@ -32,12 +32,10 @@ Never call `llm_query` or `rlm_query` without embedding the relevant context exc
 - Use `rlm_query` when the subtask itself requires deeper thinking: multi-step reasoning, solving a sub-problem that needs its own REPL and iteration, or tasks where a single LLM call might not be enough. The child RLM can write and run code, query further sub-LLMs, and iterate to find the answer.
 
 **Recursion budget (`max_depth` argument in `rlm_query*`):**
-- Treat `max_depth` in `rlm_query`, `rlm_query_batched`{async_recursion_name} as a **remaining recursion budget** for the child subtree, not an absolute depth index.
+- Treat `max_depth` in `rlm_query`, `rlm_query_batched` as a **remaining recursion budget** for the child subtree, not an absolute depth index.
 - If you delegate with `max_depth=k`, then a child that delegates again can pass at most `max_depth=k-1`.
 - Use `max_depth=0` to force a leaf child (child can reason itself, but should not spawn deeper recursive children).
 - The root/global recursion cap is still enforced by the parent RLM config; your per-call budget cannot exceed it.
-
-{async_batched_guidance_section}
 
 **Breaking down problems:** You must break problems into more digestible components—whether that means chunking or summarizing a large context, or decomposing a hard task into easier sub-problems and delegating them via `llm_query` / `rlm_query`. Use the REPL to write a **programmatic strategy** that uses these LLM calls to solve the problem, as if you were building an agent: plan steps, branch on results, combine answers in code.
 
@@ -113,18 +111,6 @@ else:
 final_answer = llm_query(f"Given trend={{trend}} and recommendation={{recommendation}}, one-sentence summary for the user.")
 ```
 
-For independent recursive subtasks, use async fan-out and then aggregate:
-```repl
-sub_prompts = [
-    f"Analyze chunk {{i}} and return key facts with citations.\\n\\n{{chunk}}"
-    for i, chunk in enumerate(chunks)
-]
-sub_answers = rlm_query_batched_async(sub_prompts, max_depth=1, max_workers=8)
-final_answer = llm_query(
-    "Merge these chunk-level findings into one final answer:\\n" + "\\n".join(sub_answers)
-)
-```
-
 As a final example, implement the solution as a **program**: try one approach via `rlm_query`; inspect the result and branch. If it suffices, use it. If not, break into one easier subproblem and delegate that only. More branches, one path runs—don't load the model. Example: prove sqrt 2 irrational.
 ```repl
 r = rlm_query("Prove sqrt 2 is irrational. Give a 1-2 sentence proof, or reply only: USE_LEMMA or USE_CONTRADICTION.")
@@ -156,7 +142,6 @@ def build_rlm_system_prompt(
     recursion_budget: int | None = None,
     current_depth: int = 0,
     max_depth: int = 1,
-    enable_rlm_query_batched_async: bool = False,
 ) -> list[dict[str, str]]:
     """
     Build the initial system prompt for the REPL environment based on extra prompt metadata.
@@ -189,48 +174,17 @@ def build_rlm_system_prompt(
     else:
         custom_tools_section = ""
 
-    if enable_rlm_query_batched_async:
-        repl_capabilities_section = (
-            "6. A `rlm_query_batched_async(prompts, model=None, max_depth=None, max_workers=None)` "
-            "function that spawns multiple recursive RLM sub-calls concurrently. Use this when child subtasks "
-            "are independent and you want parallel recursion.\n"
-            "7. A `SHOW_VARS()` function that returns all variables you have created in the REPL. "
-            "Use this to check what variables exist before using FINAL_VAR.\n"
-            "8. The ability to use `print()` statements to view the output of your REPL code "
-            "and continue your reasoning."
-        )
-        async_recursion_name = ", and `rlm_query_batched_async`"
-        async_batched_guidance_section = textwrap.dedent(
-            """
-            **`rlm_query_batched` vs `rlm_query_batched_async` (recursive calls):**
-            - `rlm_query_batched`: runs child RLM sub-calls one-by-one (serial). Use when later subtasks depend on earlier ones, or when you want stricter resource usage.
-            - `rlm_query_batched_async`: runs child RLM sub-calls concurrently (parallel workers). Use when child subtasks are independent and you want lower wall-clock time.
-            - Return order: both preserve prompt order in outputs (`outputs[i]` corresponds to `prompts[i]`) even if async children finish at different times.
-            - Practical timing: for N independent prompts, serial is closer to sum of child runtimes; async is closer to the slowest child (plus overhead / provider limits).
-
-            **How to use `rlm_query_batched_async` effectively:**
-            - Use it only when child tasks are independent (e.g., per-document or per-chunk analysis).
-            - Keep prompt-to-result alignment by indexing prompts and reading outputs in the same order.
-            - Control fan-out with `max_workers` when needed; avoid huge fan-out plus deep recursion at once.
-            - Typical pattern: async fan-out for first-pass extraction, then one merge/synthesis call.
-            """
-        ).strip()
-    else:
-        repl_capabilities_section = (
-            "6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. "
-            "Use this to check what variables exist before using FINAL_VAR.\n"
-            "7. The ability to use `print()` statements to view the output of your REPL code "
-            "and continue your reasoning."
-        )
-        async_recursion_name = ""
-        async_batched_guidance_section = ""
+    repl_capabilities_section = (
+        "6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. "
+        "Use this to check what variables exist before using FINAL_VAR.\n"
+        "7. The ability to use `print()` statements to view the output of your REPL code "
+        "and continue your reasoning."
+    )
 
     # Insert custom tools section into the system prompt
     final_system_prompt = system_prompt.format(
         custom_tools_section=custom_tools_section,
         repl_capabilities_section=repl_capabilities_section,
-        async_recursion_name=async_recursion_name,
-        async_batched_guidance_section=async_batched_guidance_section,
     )
 
     if recursion_budget is not None:

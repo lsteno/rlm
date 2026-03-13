@@ -2,12 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.11"
 
-[manifest]
-members = [
-    "rlms",
-    "rlms-training",
-]
-
 [[package]]
 name = "aiofiles"
 version = "24.1.0"
@@ -1895,17 +1889,6 @@ test = [
     { name = "pytest-cov", specifier = ">=6.0.0" },
 ]
 training = [{ name = "pyarrow", specifier = ">=23.0.0" }]
-
-[[package]]
-name = "rlms-training"
-version = "0.0.0"
-source = { editable = "training" }
-dependencies = [
-    { name = "pyarrow" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pyarrow", specifier = ">=23.0.0" }]
 
 [[package]]
 name = "rsa"

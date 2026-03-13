@@ -183,87 +183,6 @@ class TestRlmQueryBatchedWithoutSubcallFn:
         repl.cleanup()
 
 
-class TestRlmQueryBatchedAsyncWithSubcallFn:
-    """Tests for concurrent rlm_query_batched_async when subcall_fn is provided."""
-
-    def test_async_batched_calls_subcall_fn_per_prompt(self):
-        """rlm_query_batched_async should call subcall_fn once per prompt."""
-        completions = [
-            _make_completion("answer 1"),
-            _make_completion("answer 2"),
-            _make_completion("answer 3"),
-        ]
-        subcall_fn = MagicMock(side_effect=completions)
-        repl = LocalREPL(subcall_fn=subcall_fn, enable_rlm_query_batched_async=True)
-        result = repl.execute_code(
-            "answers = rlm_query_batched_async(['q1', 'q2', 'q3'])\nprint(len(answers))"
-        )
-        assert result.stderr == ""
-        assert "3" in result.stdout
-        assert repl.locals["answers"] == ["answer 1", "answer 2", "answer 3"]
-        assert subcall_fn.call_count == 3
-        repl.cleanup()
-
-    def test_async_batched_with_max_depth_override(self):
-        """rlm_query_batched_async should pass max_depth to each subcall_fn call."""
-        subcall_fn = MagicMock(return_value=_make_completion("ok"))
-        repl = LocalREPL(subcall_fn=subcall_fn, enable_rlm_query_batched_async=True)
-        repl.execute_code("rlm_query_batched_async(['q1', 'q2'], max_depth=5)")
-        assert subcall_fn.call_count == 2
-        for call in subcall_fn.call_args_list:
-            assert call[0][2] == 5
-        repl.cleanup()
-
-    def test_async_batched_tracks_all_pending_calls(self):
-        """rlm_query_batched_async should track all successful completions."""
-        completions = [_make_completion(f"resp {i}") for i in range(3)]
-        subcall_fn = MagicMock(side_effect=completions)
-        repl = LocalREPL(subcall_fn=subcall_fn, enable_rlm_query_batched_async=True)
-        result = repl.execute_code("rlm_query_batched_async(['a', 'b', 'c'])")
-        assert len(result.rlm_calls) == 3
-        assert [c.response for c in result.rlm_calls] == ["resp 0", "resp 1", "resp 2"]
-        repl.cleanup()
-
-    def test_async_batched_partial_failure(self):
-        """If one async subcall fails, others should still succeed."""
-        subcall_fn = MagicMock(
-            side_effect=[
-                _make_completion("ok 1"),
-                RuntimeError("boom"),
-                _make_completion("ok 3"),
-            ]
-        )
-        repl = LocalREPL(subcall_fn=subcall_fn, enable_rlm_query_batched_async=True)
-        result = repl.execute_code("answers = rlm_query_batched_async(['a', 'b', 'c'])")
-        assert result.stderr == ""
-        answers = repl.locals["answers"]
-        assert answers[0] == "ok 1"
-        assert "Error" in answers[1]
-        assert "boom" in answers[1]
-        assert answers[2] == "ok 3"
-        repl.cleanup()
-
-
-class TestRlmQueryBatchedAsyncWithoutSubcallFn:
-    """Tests for rlm_query_batched_async fallback when no subcall_fn."""
-
-    def test_async_batched_falls_back_to_llm_query_batched(self):
-        """Without subcall_fn, async batched should fall back to llm_query_batched."""
-        repl = LocalREPL(enable_rlm_query_batched_async=True)
-        repl.execute_code("answers = rlm_query_batched_async(['q1', 'q2'])")
-        answers = repl.locals["answers"]
-        assert len(answers) == 2
-        assert all("Error" in a for a in answers)
-        repl.cleanup()
-
-    def test_async_batched_is_unavailable_by_default(self):
-        """Without opt-in, async helper should not be available in REPL globals."""
-        repl = LocalREPL()
-        result = repl.execute_code("rlm_query_batched_async(['q1'])")
-        assert "NameError" in result.stderr
-        repl.cleanup()
-
-
 class TestLlmQueryDoesNotUseSubcallFn:
     """Verify that llm_query never uses subcall_fn even when one is present."""
 
@@ -310,11 +229,3 @@ class TestRlmQueryScaffoldRestoration:
         assert repl.locals["answers"] == ["real"]
         repl.cleanup()
 
-    def test_rlm_query_batched_async_restored_after_overwrite(self):
-        """If model overwrites rlm_query_batched_async, the next execution should have the real one."""
-        subcall_fn = MagicMock(return_value=_make_completion("real"))
-        repl = LocalREPL(subcall_fn=subcall_fn, enable_rlm_query_batched_async=True)
-        repl.execute_code("rlm_query_batched_async = 'garbage'")
-        repl.execute_code("answers = rlm_query_batched_async(['q1'])")
-        assert repl.locals["answers"] == ["real"]
-        repl.cleanup()

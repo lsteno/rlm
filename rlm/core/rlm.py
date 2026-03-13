@@ -71,7 +71,6 @@ class RLM:
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         compaction_threshold_pct: float = 0.85,
-        enable_rlm_query_batched_async: bool = False,
         on_subcall_start: Callable[[int, str, str], None] | None = None,
         on_subcall_complete: Callable[[int, str, float, str | None], None] | None = None,
         on_iteration_start: Callable[[int, int], None] | None = None,
@@ -107,8 +106,6 @@ class RLM:
                 when root context reaches compaction_threshold_pct of the model's context limit.
             compaction_threshold_pct: When compaction is on, trigger summarization when root
                 message token count reaches this fraction of the model context limit (default 0.85).
-            enable_rlm_query_batched_async: If True, expose `rlm_query_batched_async` in the
-                REPL and include async recursive batching guidance in the system prompt.
             on_subcall_start: Callback fired when a child RLM starts. Args: (depth, model, prompt_preview).
             on_subcall_complete: Callback fired when a child RLM completes. Args: (depth, model, duration, error_or_none).
             on_iteration_start: Callback fired when an iteration starts. Args: (depth, iteration_num).
@@ -139,7 +136,6 @@ class RLM:
 
         self.compaction = compaction
         self.compaction_threshold_pct = compaction_threshold_pct
-        self.enable_rlm_query_batched_async = enable_rlm_query_batched_async
 
         self.depth = depth
         self.max_depth = max_depth
@@ -242,8 +238,6 @@ class RLM:
             # For local environment with max_depth > 1, pass subcall callback for recursive RLM calls
             if self.environment_type == "local" and self.max_depth > 1:
                 env_kwargs["subcall_fn"] = self._subcall
-            if self.environment_type == "local":
-                env_kwargs["enable_rlm_query_batched_async"] = self.enable_rlm_query_batched_async
             # Pass custom tools to the environment
             if self.custom_tools is not None:
                 env_kwargs["custom_tools"] = self.custom_tools
@@ -276,7 +270,6 @@ class RLM:
             recursion_budget=self.recursion_budget,
             current_depth=self.depth,
             max_depth=self.max_depth,
-            enable_rlm_query_batched_async=self.enable_rlm_query_batched_async,
         )
         if self.compaction:
             message_history[0]["content"] += (
@@ -804,7 +797,6 @@ class RLM:
             # Propagate callbacks to children for nested tracking
             on_subcall_start=self.on_subcall_start,
             on_subcall_complete=self.on_subcall_complete,
-            enable_rlm_query_batched_async=self.enable_rlm_query_batched_async,
         )
         try:
             result = child.completion(prompt, root_prompt=None)
