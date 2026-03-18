@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
 
@@ -135,6 +136,7 @@ class LocalREPL(NonIsolatedEnv):
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
+        rlm_query_batched_max_workers: int = 8,
         **kwargs,
     ):
         super().__init__(persistent=persistent, depth=depth, **kwargs)
@@ -147,6 +149,7 @@ class LocalREPL(NonIsolatedEnv):
         self._context_count: int = 0
         self._history_count: int = 0
         self.compaction = compaction
+        self.rlm_query_batched_max_workers = max(1, rlm_query_batched_max_workers)
 
         # Custom tools: functions available in the REPL
         self.custom_tools = custom_tools or {}
@@ -355,14 +358,38 @@ class LocalREPL(NonIsolatedEnv):
             List of responses in the same order as input prompts.
         """
         if self.subcall_fn is not None:
-            results = []
-            for prompt in prompts:
+            if len(prompts) == 0:
+                return []
+
+            def run_one(index: int, prompt: str) -> tuple[int, RLMChatCompletion | None, str]:
                 try:
                     completion = self._invoke_subcall(prompt, model=model, max_depth=max_depth)
-                    self._pending_llm_calls.append(completion)
-                    results.append(completion.response)
+                    return index, completion, completion.response
                 except Exception as e:
-                    results.append(f"Error: RLM query failed - {e}")
+                    return index, None, f"Error: RLM query failed - {e}"
+
+            max_workers = min(self.rlm_query_batched_max_workers, len(prompts))
+            indexed_results: list[str | None] = [None] * len(prompts)
+            indexed_completions: list[RLMChatCompletion | None] = [None] * len(prompts)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(run_one, index, prompt)
+                    for index, prompt in enumerate(prompts)
+                ]
+                for future in as_completed(futures):
+                    index, completion, response = future.result()
+                    indexed_results[index] = response
+                    indexed_completions[index] = completion
+
+            for completion in indexed_completions:
+                if completion is not None:
+                    self._pending_llm_calls.append(completion)
+
+            results = [
+                result if result is not None else "Error: RLM query failed - Missing response"
+                for result in indexed_results
+            ]
             return results
 
         # Fall back to plain batched LM call if no recursive capability
