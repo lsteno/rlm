@@ -93,11 +93,8 @@ def _extract_json(text: str) -> dict[str, Any]:
     return parsed
 
 
-def _escape_md(text: str, max_len: int = 240) -> str:
-    s = text.replace("\r", "").replace("\n", " <br> ").replace("|", "\\|").strip()
-    if len(s) > max_len:
-        return s[: max_len - 3] + "..."
-    return s
+def _escape_md(text: str) -> str:
+    return text.replace("\r", "").replace("\n", " <br> ").replace("|", "\\|").strip()
 
 
 def _to_bool(value: Any) -> bool:
