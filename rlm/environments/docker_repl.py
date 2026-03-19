@@ -119,6 +119,14 @@ def llm_query_batched(prompts, model=None):
     except Exception as e:
         return [f"Error: {{e}}"] * len(prompts)
 
+
+def rlm_query(prompt, model=None, max_depth=None):
+    return llm_query(prompt, model=model)
+
+
+def rlm_query_batched(prompts, model=None, max_depth=None):
+    return llm_query_batched(prompts, model=model)
+
 def load_state():
     if os.path.exists(STATE):
         try:
@@ -155,7 +163,7 @@ def SHOW_VARS():
         return "No variables created yet. Use ```repl``` blocks to create variables."
     return f"Available variables: {{available}}"
 
-_globals = {{"__builtins__": __builtins__, "__name__": "__main__", "llm_query": llm_query, "llm_query_batched": llm_query_batched, "FINAL_VAR": FINAL_VAR, "SHOW_VARS": SHOW_VARS}}
+_globals = {{"__builtins__": __builtins__, "__name__": "__main__", "llm_query": llm_query, "llm_query_batched": llm_query_batched, "rlm_query": rlm_query, "rlm_query_batched": rlm_query_batched, "FINAL_VAR": FINAL_VAR, "SHOW_VARS": SHOW_VARS}}
 
 code = base64.b64decode("{code_b64}").decode()
 stdout_buf, stderr_buf = io.StringIO(), io.StringIO()

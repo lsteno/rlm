@@ -1,5 +1,6 @@
 """Tests for rlm_query and rlm_query_batched in LocalREPL."""
 
+import time
 from unittest.mock import MagicMock
 
 from rlm.core.types import RLMChatCompletion, UsageSummary
@@ -167,6 +168,20 @@ class TestRlmQueryBatchedWithSubcallFn:
         repl.execute_code("answers = rlm_query_batched(['only one'])")
         assert repl.locals["answers"] == ["single"]
         subcall_fn.assert_called_once_with("only one", None)
+        repl.cleanup()
+
+    def test_batched_preserves_order_with_out_of_order_completion(self):
+        """Parallel rlm_query_batched should preserve input order."""
+
+        def delayed_subcall(prompt: str, model=None, max_depth=None):
+            delays = {"q1": 0.08, "q2": 0.01, "q3": 0.03}
+            time.sleep(delays[prompt])
+            return _make_completion(f"resp:{prompt}")
+
+        repl = LocalREPL(subcall_fn=delayed_subcall)
+        repl.execute_code("answers = rlm_query_batched(['q1', 'q2', 'q3'])")
+        assert repl.locals["answers"] == ["resp:q1", "resp:q2", "resp:q3"]
+        assert [c.response for c in repl._pending_llm_calls] == ["resp:q1", "resp:q2", "resp:q3"]
         repl.cleanup()
 
 

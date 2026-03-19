@@ -34,6 +34,32 @@ export interface ParsedJSONL {
   config: RLMConfigMetadata;
 }
 
+function hasConfig(config: RLMConfigMetadata): boolean {
+  return (
+    config.root_model !== null ||
+    config.max_depth !== null ||
+    config.max_iterations !== null ||
+    config.backend !== null ||
+    config.backend_kwargs !== null ||
+    config.environment_type !== null ||
+    config.environment_kwargs !== null ||
+    config.other_backends !== null
+  );
+}
+
+function configFromRunMetadata(runMetadata: Record<string, unknown>): RLMConfigMetadata {
+  return {
+    root_model: (runMetadata.root_model as string | null) ?? null,
+    max_depth: (runMetadata.max_depth as number | null) ?? null,
+    max_iterations: (runMetadata.max_iterations as number | null) ?? null,
+    backend: (runMetadata.backend as string | null) ?? null,
+    backend_kwargs: (runMetadata.backend_kwargs as Record<string, unknown> | null) ?? null,
+    environment_type: (runMetadata.environment_type as string | null) ?? null,
+    environment_kwargs: (runMetadata.environment_kwargs as Record<string, unknown> | null) ?? null,
+    other_backends: (runMetadata.other_backends as string[] | null) ?? null,
+  };
+}
+
 export function parseJSONL(content: string): ParsedJSONL {
   const lines = content.trim().split('\n').filter(line => line.trim());
   const iterations: RLMIteration[] = [];
@@ -43,7 +69,7 @@ export function parseJSONL(content: string): ParsedJSONL {
     try {
       const parsed = JSON.parse(line);
       
-      // Check if this is a metadata entry
+      // Raw logger metadata entries
       if (parsed.type === 'metadata') {
         config = {
           root_model: parsed.root_model ?? null,
@@ -55,8 +81,23 @@ export function parseJSONL(content: string): ParsedJSONL {
           environment_kwargs: parsed.environment_kwargs ?? null,
           other_backends: parsed.other_backends ?? null,
         };
+      // Generated SFT record wrapper format:
+      // { ..., trace: { iterations: [...], run_metadata: {...} } }
+      } else if (parsed.trace && Array.isArray(parsed.trace.iterations)) {
+        iterations.push(...(parsed.trace.iterations as RLMIteration[]));
+
+        if (!hasConfig(config) && parsed.trace.run_metadata && typeof parsed.trace.run_metadata === 'object') {
+          config = configFromRunMetadata(parsed.trace.run_metadata as Record<string, unknown>);
+        }
+      // Direct trajectory wrapper format: { iterations: [...], run_metadata: {...} }
+      } else if (Array.isArray(parsed.iterations)) {
+        iterations.push(...(parsed.iterations as RLMIteration[]));
+
+        if (!hasConfig(config) && parsed.run_metadata && typeof parsed.run_metadata === 'object') {
+          config = configFromRunMetadata(parsed.run_metadata as Record<string, unknown>);
+        }
       } else {
-        // This is an iteration entry
+        // Raw logger iteration entry
         iterations.push(parsed as RLMIteration);
       }
     } catch (e) {

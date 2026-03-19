@@ -6,6 +6,7 @@ Follows the same HTTP broker pattern as ModalREPL for LLM communication.
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import textwrap
 import threading
@@ -102,7 +103,7 @@ if __name__ == "__main__":
 # =============================================================================
 
 
-def _build_exec_script(code: str, broker_port: int = 8888) -> str:
+def _build_exec_script(code: str, broker_port: int = 8888, depth: int = 1) -> str:
     """
     Build a script that executes code with state persistence.
     LLM queries go through the local broker server.
@@ -135,7 +136,7 @@ def llm_query(prompt, model=None):
     try:
         response = requests.post(
             f"{{BROKER_URL}}/enqueue",
-            json={{"type": "single", "prompt": prompt, "model": model}},
+            json={{"type": "single", "prompt": prompt, "model": model, "depth": {depth}}},
             timeout=300,
         )
         data = response.json()
@@ -151,7 +152,7 @@ def llm_query_batched(prompts, model=None):
     try:
         response = requests.post(
             f"{{BROKER_URL}}/enqueue",
-            json={{"type": "batched", "prompts": prompts, "model": model}},
+            json={{"type": "batched", "prompts": prompts, "model": model, "depth": {depth}}},
             timeout=300,
         )
         data = response.json()
@@ -160,6 +161,16 @@ def llm_query_batched(prompts, model=None):
         return data.get("responses", ["Error: No response"] * len(prompts))
     except Exception as e:
         return [f"Error: LM query failed - {{e}}"] * len(prompts)
+
+
+def rlm_query(prompt, model=None, max_depth=None):
+    """Compatibility alias for recursive query API in isolated environments."""
+    return llm_query(prompt, model=model)
+
+
+def rlm_query_batched(prompts, model=None, max_depth=None):
+    """Compatibility alias for recursive batched query API in isolated environments."""
+    return llm_query_batched(prompts, model=model)
 
 
 # =============================================================================
@@ -218,6 +229,8 @@ _globals = {{
     "__name__": "__main__",
     "llm_query": llm_query,
     "llm_query_batched": llm_query_batched,
+    "rlm_query": rlm_query,
+    "rlm_query_batched": rlm_query_batched,
     "FINAL_VAR": FINAL_VAR,
 }}
 
@@ -278,13 +291,15 @@ class E2BREPL(IsolatedEnv):
         context_payload: dict | list | str | None = None,
         setup_code: str | None = None,
         persistent: bool = False,
+        depth: int = 1,
+        poller_max_workers: int = 8,
         **kwargs: Any,
     ):
         if persistent:
             raise NotImplementedError(
                 "Persistent REPLs are currently not supported for environment: E2BREPL"
             )
-        super().__init__(persistent=persistent, **kwargs)
+        super().__init__(persistent=persistent, depth=depth, **kwargs)
 
         self.timeout = timeout
         self.lm_handler_address = lm_handler_address
@@ -298,6 +313,7 @@ class E2BREPL(IsolatedEnv):
         # Polling thread for LLM requests
         self.poller_thread: threading.Thread | None = None
         self.poller_stop = threading.Event()
+        self.poller_max_workers = max(1, poller_max_workers)
         self.pending_llm_calls: list[RLMChatCompletion] = []
         self._calls_lock = threading.Lock()
 
@@ -370,19 +386,23 @@ class E2BREPL(IsolatedEnv):
                 )
                 pending = resp.json().get("pending", [])
 
-                for item in pending:
-                    request_id = item["id"]
-                    req_data = item["request"]
+                if pending:
+                    max_workers = min(self.poller_max_workers, len(pending))
 
-                    # Handle the request
-                    response = self._handle_llm_request(req_data)
+                    def process_item(item: dict) -> None:
+                        request_id = item["id"]
+                        req_data = item["request"]
+                        response = self._handle_llm_request(req_data)
+                        requests.post(
+                            f"{self.broker_url}/respond",
+                            json={"id": request_id, "response": response},
+                            timeout=10,
+                        )
 
-                    # Send response back
-                    requests.post(
-                        f"{self.broker_url}/respond",
-                        json={"id": request_id, "response": response},
-                        timeout=10,
-                    )
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(process_item, item) for item in pending]
+                        for future in as_completed(futures):
+                            future.result()
 
             except requests.exceptions.RequestException:
                 pass
@@ -398,7 +418,7 @@ class E2BREPL(IsolatedEnv):
 
         if req_type == "single":
             prompt = req_data.get("prompt")
-            request = LMRequest(prompt=prompt, model=model)
+            request = LMRequest(prompt=prompt, model=model, depth=self.depth)
             response = send_lm_request(self.lm_handler_address, request)
 
             if not response.success:
@@ -412,7 +432,12 @@ class E2BREPL(IsolatedEnv):
 
         elif req_type == "batched":
             prompts = req_data.get("prompts", [])
-            responses = send_lm_request_batched(self.lm_handler_address, prompts, model=model)
+            responses = send_lm_request_batched(
+                self.lm_handler_address,
+                prompts,
+                model=model,
+                depth=self.depth,
+            )
 
             results = []
             for resp in responses:
@@ -448,7 +473,7 @@ class E2BREPL(IsolatedEnv):
             self.pending_llm_calls.clear()
 
         # Build and write the script to sandbox
-        script = _build_exec_script(code, self.BROKER_PORT)
+        script = _build_exec_script(code, self.BROKER_PORT, self.depth)
         self.sandbox.files.write("/tmp/run_script.py", script)
 
         # Run the script

@@ -41,6 +41,7 @@ MANIFEST
 *.manifest
 *.spec
 *.parquet
+data/*
 
 # Installer logs
 pip-log.txt

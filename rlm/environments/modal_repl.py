@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import textwrap
 import threading
@@ -172,6 +173,16 @@ def llm_query_batched(prompts, model=None):
         return [f"Error: LM query failed - {{e}}"] * len(prompts)
 
 
+def rlm_query(prompt, model=None, max_depth=None):
+    """Compatibility alias for recursive query API in isolated environments."""
+    return llm_query(prompt, model=model)
+
+
+def rlm_query_batched(prompts, model=None, max_depth=None):
+    """Compatibility alias for recursive batched query API in isolated environments."""
+    return llm_query_batched(prompts, model=model)
+
+
 # =============================================================================
 # State Management
 # =============================================================================
@@ -237,6 +248,8 @@ _globals = {{
     "__name__": "__main__",
     "llm_query": llm_query,
     "llm_query_batched": llm_query_batched,
+    "rlm_query": rlm_query,
+    "rlm_query_batched": rlm_query_batched,
     "FINAL_VAR": FINAL_VAR,
     "SHOW_VARS": SHOW_VARS,
 }}
@@ -301,6 +314,7 @@ class ModalREPL(IsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
+        poller_max_workers: int = 8,
         **kwargs,
     ):
         if persistent:
@@ -321,6 +335,7 @@ class ModalREPL(IsolatedEnv):
         self.broker_url: str | None = None
         self.poller_thread: threading.Thread | None = None
         self.poller_stop = threading.Event()
+        self.poller_max_workers = max(1, poller_max_workers)
         self.pending_llm_calls: list[RLMChatCompletion] = []
         self._calls_lock = threading.Lock()
 
@@ -376,19 +391,23 @@ class ModalREPL(IsolatedEnv):
                 )
                 pending = resp.json().get("pending", [])
 
-                for item in pending:
-                    request_id = item["id"]
-                    req_data = item["request"]
+                if pending:
+                    max_workers = min(self.poller_max_workers, len(pending))
 
-                    # Handle the request
-                    response = self._handle_llm_request(req_data)
+                    def process_item(item: dict) -> None:
+                        request_id = item["id"]
+                        req_data = item["request"]
+                        response = self._handle_llm_request(req_data)
+                        requests.post(
+                            f"{self.broker_url}/respond",
+                            json={"id": request_id, "response": response},
+                            timeout=10,
+                        )
 
-                    # Send response back
-                    requests.post(
-                        f"{self.broker_url}/respond",
-                        json={"id": request_id, "response": response},
-                        timeout=10,
-                    )
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(process_item, item) for item in pending]
+                        for future in as_completed(futures):
+                            future.result()
 
             except requests.exceptions.RequestException:
                 pass

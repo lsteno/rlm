@@ -6,12 +6,115 @@ Uses a multi-threaded socket server. Protocol: 4-byte length prefix + JSON paylo
 
 import asyncio
 import time
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from socketserver import StreamRequestHandler, ThreadingTCPServer
-from threading import Thread
+from threading import Event, Lock, Thread
+from typing import Any
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import LMRequest, LMResponse, socket_recv, socket_send
 from rlm.core.types import RLMChatCompletion, UsageSummary
+
+
+@dataclass
+class QueuedBatchItem:
+    prompt: str | dict[str, Any]
+    done: Event = field(default_factory=Event)
+    response: str | None = None
+    error: str | None = None
+
+
+class AsyncBatchExecutor:
+    """Cross-request async batch executor for high-throughput inference."""
+
+    def __init__(
+        self,
+        batch_wait_ms: float,
+        batch_max_size: int,
+        max_inflight_batches: int,
+        max_pending_prompts: int,
+    ):
+        self.batch_wait_s = max(batch_wait_ms, 1.0) / 1000.0
+        self.batch_max_size = max(batch_max_size, 1)
+        self.max_pending_prompts = max(max_pending_prompts, self.batch_max_size)
+
+        self._lock = Lock()
+        self._stop = Event()
+        self._pending_total = 0
+        self._queues: dict[tuple[int, str], deque[QueuedBatchItem]] = defaultdict(deque)
+        self._client_refs: dict[tuple[int, str], BaseLM] = {}
+        self._executor = ThreadPoolExecutor(max_workers=max(max_inflight_batches, 1))
+        self._dispatcher = Thread(target=self._dispatch_loop, daemon=True)
+        self._dispatcher.start()
+
+    def submit(
+        self,
+        client: BaseLM,
+        model: str,
+        prompt: str | dict[str, Any],
+    ) -> QueuedBatchItem:
+        with self._lock:
+            if self._pending_total >= self.max_pending_prompts:
+                raise RuntimeError(
+                    "Batch queue is full. Increase max_pending_prompts or reduce request rate."
+                )
+
+            key = (id(client), model)
+            item = QueuedBatchItem(prompt=prompt)
+            self._queues[key].append(item)
+            self._client_refs[key] = client
+            self._pending_total += 1
+            return item
+
+    def _dispatch_loop(self) -> None:
+        while not self._stop.is_set():
+            batches: list[tuple[BaseLM, str, list[QueuedBatchItem]]] = []
+            with self._lock:
+                for key, queue in list(self._queues.items()):
+                    if not queue:
+                        continue
+                    client = self._client_refs[key]
+                    model = key[1]
+                    size = min(len(queue), self.batch_max_size)
+                    items = [queue.popleft() for _ in range(size)]
+                    self._pending_total -= size
+                    batches.append((client, model, items))
+
+                    if not queue:
+                        del self._queues[key]
+                        del self._client_refs[key]
+
+            for client, model, items in batches:
+                self._executor.submit(self._run_batch, client, model, items)
+
+            self._stop.wait(self.batch_wait_s)
+
+    @staticmethod
+    def _run_batch(client: BaseLM, model: str, items: list[QueuedBatchItem]) -> None:
+        prompts = [item.prompt for item in items]
+        try:
+            responses = asyncio.run(client.acompletion_batched(prompts, model=model))
+
+            if len(responses) != len(items):
+                raise RuntimeError(
+                    f"Batched response size mismatch: expected {len(items)}, got {len(responses)}"
+                )
+
+            for item, response in zip(items, responses, strict=True):
+                item.response = response
+                item.done.set()
+        except Exception as e:
+            err = str(e)
+            for item in items:
+                item.error = err
+                item.done.set()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._dispatcher.join(timeout=2.0)
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 class LMRequestHandler(StreamRequestHandler):
@@ -82,19 +185,25 @@ class LMRequestHandler(StreamRequestHandler):
     def _handle_batched(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
         """Handle a batched prompts request using async for concurrency."""
         client = handler.get_client(request.model, request.depth)
+        if request.prompts is None:
+            return LMResponse.error_response("Missing 'prompts' in batched request")
 
         start_time = time.perf_counter()
+        root_model = request.model or client.model_name
 
-        async def run_all():
-            tasks = [client.acompletion(prompt) for prompt in request.prompts]
-            return await asyncio.gather(*tasks)
+        try:
+            results = handler.run_batched(
+                client=client,
+                model=root_model,
+                prompts=request.prompts,
+            )
+        except Exception as e:
+            return LMResponse.error_response(f"Batched request failed: {e}")
 
-        results = asyncio.run(run_all())
         end_time = time.perf_counter()
 
         total_time = end_time - start_time
         model_usage = client.get_last_usage()
-        root_model = request.model or client.model_name
         usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
 
         chat_completions = [
@@ -132,6 +241,11 @@ class LMHandler:
         host: str = "127.0.0.1",
         port: int = 0,  # auto-assign available port
         other_backend_client: BaseLM | None = None,
+        batch_wait_ms: float = 8.0,
+        batch_max_size: int = 64,
+        max_inflight_batches: int = 4,
+        max_pending_prompts: int = 4096,
+        batch_request_timeout_s: float = 300.0,
     ):
         self.default_client = client
         self.other_backend_client = other_backend_client
@@ -140,6 +254,13 @@ class LMHandler:
         self._server: ThreadingLMServer | None = None
         self._thread: Thread | None = None
         self._port = port
+        self.batch_request_timeout_s = batch_request_timeout_s
+        self._batch_executor = AsyncBatchExecutor(
+            batch_wait_ms=batch_wait_ms,
+            batch_max_size=batch_max_size,
+            max_inflight_batches=max_inflight_batches,
+            max_pending_prompts=max_pending_prompts,
+        )
 
         self.register_client(client.model_name, client)
 
@@ -195,6 +316,32 @@ class LMHandler:
             self._server.shutdown()
             self._server = None
             self._thread = None
+        self._batch_executor.shutdown()
+
+    def run_batched(
+        self,
+        client: BaseLM,
+        model: str,
+        prompts: list[str | dict[str, Any]],
+    ) -> list[str]:
+        """Run batched prompts through shared cross-request scheduler."""
+        if len(prompts) == 0:
+            return []
+
+        queued = [self._batch_executor.submit(client, model, prompt) for prompt in prompts]
+        deadline = time.perf_counter() + self.batch_request_timeout_s
+        results: list[str] = []
+        for item in queued:
+            timeout = max(0.0, deadline - time.perf_counter())
+            if not item.done.wait(timeout=timeout):
+                raise TimeoutError("Timed out waiting for batched completion")
+            if item.error is not None:
+                raise RuntimeError(item.error)
+            if item.response is None:
+                raise RuntimeError("Missing response from batched completion")
+            results.append(item.response)
+
+        return results
 
     def completion(self, prompt: str, model: str | None = None) -> str:
         """Direct completion call (for main process use)."""

@@ -53,6 +53,7 @@ class RLM:
         backend_kwargs: dict[str, Any] | None = None,
         environment: EnvironmentType = "local",
         environment_kwargs: dict[str, Any] | None = None,
+        lm_handler_kwargs: dict[str, Any] | None = None,
         depth: int = 0,
         max_depth: int = 1,
         recursion_budget: int | None = None,
@@ -82,6 +83,7 @@ class RLM:
             backend_kwargs: The kwargs to pass to the backend.
             environment: The environment to use for the RLM.
             environment_kwargs: The kwargs to pass to the environment.
+            lm_handler_kwargs: The kwargs to pass to LMHandler (e.g., batching scheduler settings).
             depth: The current depth of the RLM (0-indexed).
             max_depth: The maximum depth of recursion. When depth >= max_depth, falls back to plain LM completion.
             recursion_budget: The recursion budget visible to this node. At root, defaults to
@@ -117,6 +119,9 @@ class RLM:
         self.environment_type = environment
         self.environment_kwargs = (
             environment_kwargs.copy() if environment_kwargs is not None else {}
+        )
+        self.lm_handler_kwargs = (
+            lm_handler_kwargs.copy() if lm_handler_kwargs is not None else {}
         )
         # Validate other_backends: currently only support one additional backend
         if other_backends is not None:
@@ -208,7 +213,11 @@ class RLM:
         if self.other_backends and self.other_backend_kwargs:
             other_backend_client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
 
-        lm_handler = LMHandler(client, other_backend_client=other_backend_client)
+        lm_handler = LMHandler(
+            client,
+            other_backend_client=other_backend_client,
+            **self.lm_handler_kwargs,
+        )
 
         # Register other clients to be available as sub-call options (by model name)
         if self.other_backends and self.other_backend_kwargs:
@@ -777,6 +786,7 @@ class RLM:
             backend_kwargs=child_backend_kwargs,
             environment=self.environment_type,
             environment_kwargs=self.environment_kwargs,
+            lm_handler_kwargs=self.lm_handler_kwargs,
             depth=next_depth,
             max_depth=effective_max_depth,
             recursion_budget=child_recursion_budget,
