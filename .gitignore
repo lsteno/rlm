@@ -42,6 +42,7 @@ MANIFEST
 *.spec
 *.parquet
 data/*
+output/*
 
 # Installer logs
 pip-log.txt
