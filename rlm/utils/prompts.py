@@ -15,6 +15,7 @@ The REPL environment is initialized with:
 5. A `rlm_query_batched(prompts, model=None, max_depth=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. Falls back to `llm_query_batched` if recursion is not available.
 {repl_capabilities_section}
 {custom_tools_section}
+{iteration_budget_section}
 
 **CRITICAL — sub-LLMs do NOT have access to `context` automatically.** When you call `llm_query`, `llm_query_batched`, `rlm_query`, or `rlm_query_batched`, the sub-LLM only sees the prompt string you pass. It has NO access to the `context` variable that YOU have in your REPL. You MUST always include the relevant portion of `context` directly inside the prompt string you pass to every sub-LLM call. For example:
 ```repl
@@ -26,6 +27,8 @@ chunk = context[:50000]
 answer = llm_query(f"Using this text, what year was the treaty signed?\\n\\n{{chunk}}")
 ```
 Never call `llm_query` or `rlm_query` without embedding the relevant context excerpt in the prompt.
+
+**Subcall context-window guard:** sub-LLM context windows are limited. Before every subcall, ensure the prompt (instructions + embedded context + expected output scaffolding) fits in the child model context window. If it might not fit, chunk or compress first, then call `llm_query*` / `rlm_query*`.
 
 **When to use `llm_query` vs `rlm_query`:**
 - Use `llm_query` for simple, one-shot tasks: extracting info from a chunk, summarizing text, answering a factual question, classifying content. These are fast single LLM calls.
@@ -135,6 +138,54 @@ Think step by step carefully, plan, and execute this plan immediately in your re
 )
 
 
+RLM_SYSTEM_PROMPT_B = textwrap.dedent(
+    """You are solving a query using a Python REPL with iterative turns and optional recursive sub-calls.
+
+You are given:
+1. `context`: critical source data for this query.
+2. `llm_query(prompt, model=None)`: one-shot call; use for extraction/summarization/classification.
+3. `llm_query_batched(prompts, model=None)`: parallel one-shot calls.
+4. `rlm_query(prompt, model=None, max_depth=None)`: recursive child RLM for harder multi-step subtasks.
+5. `rlm_query_batched(prompts, model=None, max_depth=None)`: parallel recursive child calls.
+{repl_capabilities_section}
+{custom_tools_section}
+{iteration_budget_section}
+
+Hard rule: sub-calls do not see `context` unless you include it in the prompt text. Always embed relevant context chunks in every `llm_query*` and `rlm_query*` prompt.
+Hard rule: sub-LLM context windows are limited. Ensure each subcall prompt fits; if not, chunk/compress first.
+
+Tool policy:
+- Prefer `llm_query` / `llm_query_batched` for simple tasks.
+- Use `rlm_query` / `rlm_query_batched` only when a subtask needs multi-step reasoning, code execution, or iterative solving.
+- If tasks are independent, batch them.
+
+Recursion policy:
+- Treat `max_depth` as remaining child budget.
+- If current budget is b>0, typical child call budget is b-1.
+- If budget is 0, do not recurse; use `llm_query*` only.
+
+Execution strategy:
+1. Inspect enough of `context` to form a concrete plan.
+2. Break work into chunks/subtasks and solve programmatically in REPL.
+3. Save intermediate evidence in variables; aggregate before concluding.
+4. Prefer evidence-grounded answers. If evidence is insufficient, say so.
+
+When executing Python, use fenced repl blocks:
+```repl
+chunk = context[:50000]
+answer = llm_query(f"Using this text, answer the question:\n\n{{chunk}}")
+```
+
+Output contract:
+- Finish with `FINAL(your answer)` or `FINAL_VAR(variable_name)` only when done.
+- `FINAL_VAR` requires that the variable already exists from a prior repl block.
+- Use `SHOW_VARS()` if uncertain.
+
+Act immediately each turn: do useful REPL work, evaluate results, and iterate until ready to finalize.
+"""
+)
+
+
 def build_rlm_system_prompt(
     system_prompt: str,
     query_metadata: QueryMetadata,
@@ -142,6 +193,7 @@ def build_rlm_system_prompt(
     recursion_budget: int | None = None,
     current_depth: int = 0,
     max_depth: int = 1,
+    max_iterations: int = 10,
 ) -> list[dict[str, str]]:
     """
     Build the initial system prompt for the REPL environment based on extra prompt metadata.
@@ -181,10 +233,18 @@ def build_rlm_system_prompt(
         "and continue your reasoning."
     )
 
+    iteration_budget_section = (
+        "\nIteration budget:\n"
+        f"- You have at most {max_iterations} total turns in this RLM call.\n"
+        "- Make each turn concrete and high-yield; avoid redundant actions.\n"
+        "- Finalize as soon as evidence is sufficient."
+    )
+
     # Insert custom tools section into the system prompt
     final_system_prompt = system_prompt.format(
         custom_tools_section=custom_tools_section,
         repl_capabilities_section=repl_capabilities_section,
+        iteration_budget_section=iteration_budget_section,
     )
 
     if recursion_budget is not None:

@@ -279,6 +279,7 @@ class RLM:
             recursion_budget=self.recursion_budget,
             current_depth=self.depth,
             max_depth=self.max_depth,
+            max_iterations=self.max_iterations,
         )
         if self.compaction:
             message_history[0]["content"] += (

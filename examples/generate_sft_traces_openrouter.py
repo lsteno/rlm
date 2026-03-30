@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from rlm import RLM
 from rlm.logger import RLMLogger
+from rlm.utils.prompts import RLM_SYSTEM_PROMPT, RLM_SYSTEM_PROMPT_B
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +40,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="minimax/minimax-m2.5",
         help="OpenRouter model name.",
+    )
+    parser.add_argument(
+        "--prompt-variant",
+        type=str,
+        choices=["A", "B"],
+        default="A",
+        help="System prompt variant: A=default, B=short/dense.",
     )
     parser.add_argument(
         "--limit",
@@ -154,6 +162,9 @@ def main() -> None:
     print(f"Processing rows [{start}:{end}] -> {len(selected_rows)} rows")
     print(f"Output JSONL: {output_path}")
     print(f"Raw logger JSONL dir: {raw_log_dir}")
+    print(f"Prompt variant: {args.prompt_variant}")
+
+    system_prompt = RLM_SYSTEM_PROMPT if args.prompt_variant == "A" else RLM_SYSTEM_PROMPT_B
 
     with output_path.open("w", encoding="utf-8") as outfile:
         for i, row in enumerate(selected_rows, start=start):
@@ -168,6 +179,7 @@ def main() -> None:
                 environment_kwargs={},
                 max_depth=args.max_depth,
                 max_iterations=args.max_iterations,
+                custom_system_prompt=system_prompt,
                 logger=logger,
                 verbose=args.verbose,
             )
@@ -183,6 +195,7 @@ def main() -> None:
                     trajectory=completion.metadata,
                 )
                 record["status"] = "ok"
+                record["prompt_variant"] = args.prompt_variant
             except Exception as exc:
                 record = {
                     "id": row.get("id"),
@@ -195,6 +208,7 @@ def main() -> None:
                         "is_exact_match": False,
                     },
                     "status": "error",
+                    "prompt_variant": args.prompt_variant,
                     "error": str(exc),
                     "trace": logger.get_trajectory(),
                 }
